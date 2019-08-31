@@ -10,9 +10,10 @@ from pyathena import connect
 import pandas as pd
 import numpy as np
 from tqdm import *
-import subprocess
 
 tqdm.pandas()
+import subprocess
+from datetime import timedelta
 
 USER_CARDS_FOUND_RESPONSE_CODE = 17210
 USER_CARDS_NOT_FOUND_RESPONSE_CODE = 17414
@@ -74,7 +75,67 @@ def get_crawledtxuuid_by_usertxuuid(user_txuuid, site_uuid):
     return crawledTxUuid
 
 
-def df_from_athena_query(query, conn):
+def get_fee_calc_json(site_uuid, usertx_uuid, calc_detail_only=False):
+    """
+    Get the fee calc for a usertx_uuid
+    """
+    path = f'fee-calculations/pSiteUuid={site_uuid}/{usertx_uuid}.json'
+
+    content_object = s3.Object("prod-fee-calculations.upside-services.com", path)
+    file_content = json.loads(content_object.get()['Body'].read().decode('utf-8'))
+
+    if calc_detail_only == True:
+        try:
+            file_content = json.loads(file_content['calculationDetail']['data'])
+        except Exception:
+            file_content = None
+
+    return file_content
+
+
+def get_user_uuid_is_new_at_site(site_uuid, user_uuid, source_terminal_filter=None):
+    """
+    Checks whether user is new based on current data
+    """
+
+    user_card_ids = get_user_card_ids(user_uuid)
+
+    user_crawled_tx = get_crawled_txns(site_uuid, source_terminal_filter=source_terminal_filter,
+                                       card_id_filter=user_card_ids) \
+        .assign(transactionTimestamp=lambda x: pd.to_datetime(x['transactionTimestamp']))
+
+    enrollment_timestamp = pd.to_datetime(
+        get_user_site_enrollment_timestamp(user_uuid=user_uuid, site_uuid=site_uuid)).tz_convert(None)
+
+    pre_user_crawled_tx = user_crawled_tx[(user_crawled_tx.transactionTimestamp < enrollment_timestamp)
+                                          & (user_crawled_tx.transactionTimestamp >= (
+                enrollment_timestamp - timedelta(days=365)))]
+    if pre_user_crawled_tx.empty:
+        is_new_at_site = True
+    else:
+        is_new_at_site = False
+
+    return {'site_uuid': site_uuid,
+            'user_uuid': user_uuid,
+            'is_new_at_site': is_new_at_site,
+            'user_card_ids': user_card_ids,
+            'enrollment_timestamp': enrollment_timestamp,
+            'pre_user_crawled_tx': pre_user_crawled_tx}
+
+
+def get_F6L4_is_new_at_site(Transactions, F6, L4, enrollTimestamp):
+    cardId_tx = Transactions[(Transactions.cardFirstSix == F6)
+                             & (Transactions.cardLastFour == L4)
+                             & (Transactions.TranTime < enrollTimestamp)
+                             & (Transactions.TranTime >= enrollTimestamp - timedelta(days=365))]
+    if cardId_tx.empty:
+        isNewAtSite = True
+    else:
+        isNewAtSite = False
+    return isNewAtSite
+
+
+def get_df_from_athena_query(query, conn):
     cursor = conn.cursor()
     result = cursor.execute(query)
     outdir = './'
@@ -102,7 +163,7 @@ def get_incremental(site_uuid, source_terminal_filter=None, user_uuid_filter=Non
             f" WHERE siteuuid in {site_uuid_list} " \
             f" ORDER BY date "
 
-    dataframe_result = df_from_athena_query(query, conn)
+    dataframe_result = get_df_from_athena_query(query, conn)
 
     if source_terminal_filter is not None:
         source_terminal_filter = get_list_if_string(source_terminal_filter)
@@ -118,17 +179,19 @@ def get_incremental(site_uuid, source_terminal_filter=None, user_uuid_filter=Non
     return dataframe_result
 
 
-def get_all_user_uuid_from_incremental(site_uuid, source_terminal_filter=None):
+def get_all_user_uuid_from_incremental(site_uuid, source_terminal_filter=None, incremental=None):
     """
     Get all useruuid that have a transaction in incremental at a site_uuid
 
     Keyword arguments:
     site_uuid -- a site_uuid or list of site_uuids
     source_terminal -- the source_terminal of the incremental transactions (list or string)
+    incremental -- rather than run a query, pass the incremental dataframe in
     """
-    return list(get_incremental(site_uuid, source_terminal_filter) \
-                .useruuid \
-                .unique())
+    if incremental is None:
+        incremental = get_incremental(site_uuid, source_terminal_filter)
+
+    return list(incremental.useruuid.unique())
 
 
 def get_user_card_ids(user_uuid):
@@ -204,8 +267,6 @@ def get_crawled_txns(site_uuid, source_terminal_filter=None, card_id_filter=None
     source_terminal_filter -- the source_terminal(s) of the incremental transactions (list or string) (default None)
     card_id_filter -- option to filter results to specfic card_id(s) (default None)
     F6L4_filter -- option to filter results to specific F6L4 (e.g. '123456-1234') (list or string) (default None)
-
-
     """
     site_uuid_list = get_list_for_query(site_uuid)
 
@@ -240,7 +301,7 @@ def get_crawled_txns(site_uuid, source_terminal_filter=None, card_id_filter=None
         F6L4_filter = get_list_for_query(F6L4_filter)
         query = f"{query} AND CONCAT(cardfirstsix,'-',cardlastfour) in {F6L4_filter} "
 
-    dataframe_result = df_from_athena_query(query, conn)
+    dataframe_result = get_df_from_athena_query(query, conn)
     return dataframe_result
 
 
@@ -388,11 +449,6 @@ def get_stats_by_month(site_uuid,
     return user_stats_by_month, shadow_stats_by_month
 
 
-def get_normalized_relative_month(relative_month):
-    normalized_relative_month = np.where(relative_month >= 0, relative_month + 1, relative_month)
-    return normalized_relative_month
-
-
 def get_no_shadows_flag(user_card_to_shadows_map):
     return [shadows for shadows in user_card_to_shadows_map.values() if shadows != []] == []
 
@@ -474,9 +530,10 @@ def generate_user_shadow_panel(site_uuid,
 
 def generate_all_site_user_shadow_panels(site_uuid,
                                          source_terminal,
-                                         crawled_data_end_timestamp=None):
+                                         incremental=None,
+                                         crawled_data_end_date=None):
     # 1 Get all user_uuid from incremental
-    all_site_users = get_all_user_uuid_from_incremental(site_uuid, source_terminal)
+    all_site_users = get_all_user_uuid_from_incremental(site_uuid, source_terminal, incremental)
 
     # 2 Get site crawled transaction data
     site_crawled_txns = get_crawled_txns(site_uuid, source_terminal)
@@ -484,19 +541,19 @@ def generate_all_site_user_shadow_panels(site_uuid,
     last_crawled_txn_timestamp = get_last_crawled_txn_timestamp(site_crawled_txns)
 
     # Curtail transaction data if needed
-    if crawled_data_end_timestamp is not None:
+    if crawled_data_end_date is not None:
         site_crawled_txns = site_crawled_txns[pd.to_datetime(site_crawled_txns.transactionTimestamp) <
-                                              crawled_data_end_timestamp]
+                                              crawled_data_end_date]
 
     panel_dict = {}
     for user_uuid in tqdm(all_site_users):
         try:
-            panel_dict[user_uuid] = generate_user_shadow_panel(site_uuid,
-                                                               user_uuid,
-                                                               source_terminal,
-                                                               site_crawled_txns,
-                                                               first_crawled_txn_timestamp,
-                                                               last_crawled_txn_timestamp)
+            panel_dict[f'{site_uuid}--{user_uuid}--{source_terminal}'] = generate_user_shadow_panel(site_uuid,
+                                                                                                    user_uuid,
+                                                                                                    source_terminal,
+                                                                                                    site_crawled_txns,
+                                                                                                    first_crawled_txn_timestamp,
+                                                                                                    last_crawled_txn_timestamp)
         except Exception:
             print("Skipping ", user_uuid)
 
@@ -534,16 +591,16 @@ def get_user_incremental_txns(site_uuid,
 #     return incremental_dict
 
 
-def generate_site_pre_post_data(panel_dict, site_uuid, source_terminal, modify_month_minus_1=True):
+def generate_pre_post_from_user_panels(panel_dict, modify_month_minus_1=True):
     df_list = []
-    for user_uuid, user_panel in panel_dict.items():
+    for key, user_panel in panel_dict.items():
         if user_panel is not None:
             if get_outlier_flag(user_panel) == False:
                 df_list += [user_panel]
 
-    site_pre_post_data = pd.concat(df_list, sort=False) \
+    pre_post_data = pd.concat(df_list, sort=False) \
         .reset_index(drop=True) \
-        .groupby(['relativeMonth', 'siteUuid'], as_index=False) \
+        .groupby(['relativeMonth'], as_index=False) \
         .agg({'userTotalAmount': 'mean',
               'shadowTotalAmount': 'mean',
               'userTotalVisits': 'mean',
@@ -551,9 +608,26 @@ def generate_site_pre_post_data(panel_dict, site_uuid, source_terminal, modify_m
               'userUuid': lambda x: x.nunique()})
 
     if modify_month_minus_1 == True:
-        site_pre_post_data = get_modified_month_minus_1(site_pre_post_data)
+        pre_post_data = get_modified_month_minus_1(pre_post_data)
 
-    return site_pre_post_data
+    return pre_post_data
+
+
+def generate_site_pre_post_data(site_uuid, source_terminal, modify_month_minus_1=True, incremental=None):
+    site_uuid = get_list_if_string(site_uuid)
+
+    panel_dict = {}
+    for site in site_uuid:
+        if incremental is not None:
+            site_incremental = incremental.query("siteuuid == @site")
+        else:
+            site_incremental = None
+
+        panel_dict.update(generate_all_site_user_shadow_panels(site, source_terminal, site_incremental))
+
+    pre_post_data = generate_pre_post_from_user_panels(panel_dict, modify_month_minus_1)
+
+    return pre_post_data
 
 
 def get_modified_month_minus_1(pre_post_panel):
@@ -569,7 +643,7 @@ def get_modified_month_minus_1(pre_post_panel):
 
 def generate_site_calendar_time_data(panel_dict, site_uuid, source_terminal, modify_month_minus_1=True):
     df_list = []
-    for user_uuid, user_panel in panel_dict.items():
+    for key, user_panel in panel_dict.items():
         if user_panel is not None:
             if get_outlier_flag(user_panel) == False:
                 user_panel = get_modified_month_minus_1(user_panel)
@@ -587,10 +661,11 @@ def generate_site_calendar_time_data(panel_dict, site_uuid, source_terminal, mod
 
 
 def serialize_panels(panel_dict, site_uuid, source_terminal, output_dir='.'):
-    for user_uuid, user_panel in panel_dict.items():
-        path = f'{output_dir}/pSiteUuid={site_uuid}/pUserUuid={user_uuid}/pSourceTerminal={source_terminal}/'
-        os.makedirs(path, exist_ok=True)
-        user_panel.to_csv(f'{path}{user_uuid}-{source_terminal}-pre_post_panel.csv', index=False)
+    for id, user_panel in panel_dict.items():
+        if user_panel is not None:
+            path = f'{output_dir}/pSiteUuid={site_uuid}/pSourceTerminal={source_terminal}'
+            os.makedirs(path, exist_ok=True)
+            user_panel.to_csv(f'{path}/{id}.csv', index=False)
 
     return
 
@@ -604,9 +679,9 @@ def serialize_user_incremental(df_dict, site_uuid, source_terminal):
     return
 
 
-def serialize_site_pre_post_data(site_pre_post_data, site_uuid, source_terminal, output_dir='.'):
-    site_pre_post_data.to_csv(f'{output_dir}/pSiteUuid={site_uuid}/{site_uuid}-{source_terminal}-pre_post_data.csv',
-                              index=False)
+def serialize_df(df, output_dir, filename, keep_index=False):
+    os.makedirs(output_dir, exist_ok=True)
+    df.to_csv(f'{output_dir}/{filename}', index=keep_index)
     return
 
 
@@ -622,10 +697,18 @@ def get_outlier_flag(user_panel, max_avg_pre_total_amount_diff=200):
     return abs(user_pre_avg_total_amount - shadow_pre_avg_total_amount) > max_avg_pre_total_amount_diff
 
 
-def get_selected_users_pre_post_panels(source_terminal, site_and_user_filepath, output_dir='.'):
+def get_selected_users_pre_post_panels(source_terminal, site_and_user_list=None, site_and_user_filepath=None,
+                                       output_dir='.'):
     os.makedirs(output_dir, exist_ok=True)
-    site_user_uuid_df = pd.read_csv(site_and_user_filepath)
 
+    if (site_and_user_list is None) and (site_and_user_filepath is not None):
+        site_user_uuid_df = pd.read_csv(site_and_user_filepath)
+    elif site_and_user_list is not None and site_and_user_filepath is None:
+        site_user_uuid_df = pd.DataFrame(site_and_user_list).rename(columns={0: 'siteuuid', 1: 'useruuid'})
+    else:
+        raise ValueError('Invalid')
+
+    panel_dict = {}
     for site_uuid in site_user_uuid_df.siteuuid.unique():
         site_crawled_txns = get_crawled_txns(site_uuid, source_terminal)
 
@@ -637,12 +720,64 @@ def get_selected_users_pre_post_panels(source_terminal, site_and_user_filepath, 
                                                     first_crawled_txn_timestamp=None,
                                                     last_crawled_txn_timestamp=None)
             if user_panel is not None:
-                user_panel.to_csv(f'{output_dir}/{site_uuid}--{user_uuid}-{source_terminal}-pre_post_panel.csv',
+                user_panel.to_csv(f'{output_dir}/{site_uuid}--{user_uuid}--{source_terminal}-pre_post_panel.csv',
                                   index=False)
+                panel_dict[f'{site_uuid}--{user_uuid}--{source_terminal}'] = user_panel
+
+    return panel_dict
+
+
+def get_operator_input():
+    def get_input_source_terminal():
+        source_terminal = input(f"\n Which sourceterminal (press ENTER for OUTSIDE) ").strip()
+        if source_terminal == "":
+            source_terminal = 'OUTSIDE'
+        return source_terminal.upper()
+
+    def get_input_output_dir():
+        output_dir = input(f"\n What is the dir to write the output? (press ENTER for current dir) ").strip()
+        if output_dir == "":
+            output_dir = '.'
+        return output_dir
+
+    proceed = None
+    while proceed not in ['y', 'n']:
+        proceed = input(f"\n Run customer journey's for specific user-site pairs? (y/n) ").strip()
+        if proceed == 'y':
+            site_and_user_filepath = input(f"\n What is the path to siteuuid and useruuid file? ").strip()
+            source_terminal = get_input_source_terminal()
+            output_dir = get_input_output_dir()
+            get_selected_users_pre_post_panels(source_terminal=source_terminal,
+                                               site_and_user_list=None,
+                                               site_and_user_filepath=site_and_user_filepath,
+                                               output_dir=output_dir)
+
+    proceed = None
+    while proceed not in ['y', 'n']:
+        proceed = input(f"\n Run all customer journey's for site? (y/n) ").strip()
+        if proceed == 'y':
+            site_uuid = input(f"\n What is the siteuuid? ").strip()
+            source_terminal = get_input_source_terminal()
+            output_dir = get_input_output_dir()
+
+            panel_dict = generate_all_site_user_shadow_panels(site_uuid=site_uuid,
+                                                              source_terminal=source_terminal)
+            serialize_panels(panel_dict, site_uuid, source_terminal, output_dir)
+
+    proceed = None
+    while proceed not in ['y', 'n']:
+        proceed = input(f"\n Generate site-level pre-post data for a site or group of sites? (y/n) ").strip()
+        if proceed == 'y':
+            site_uuid = input(f"\n What is the siteuuid? ").strip()
+            source_terminal = get_input_source_terminal()
+            output_dir = get_input_output_dir()
+            filename = input(f"\n What is the filename? ").strip()
+
+            pre_post_data = generate_site_pre_post_data(site_uuid, source_terminal)
+            serialize_df(pre_post_data, output_dir, filename)
+
     return
 
 
 if __name__ == '__main__':
-    #     generate_pre_post_graph()
-    #
-    pass
+    get_operator_input()
