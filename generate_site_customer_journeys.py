@@ -10,9 +10,10 @@ from pyathena import connect
 import pandas as pd
 import numpy as np
 from tqdm import *
-import subprocess
 
 tqdm.pandas()
+import subprocess
+from datetime import timedelta
 
 USER_CARDS_FOUND_RESPONSE_CODE = 17210
 USER_CARDS_NOT_FOUND_RESPONSE_CODE = 17414
@@ -90,6 +91,48 @@ def get_fee_calc_json(site_uuid, usertx_uuid, calc_detail_only=False):
             file_content = None
 
     return file_content
+
+
+def get_user_uuid_is_new_at_site(site_uuid, user_uuid, source_terminal_filter=None):
+    """
+    Checks whether user is new based on current data
+    """
+
+    user_card_ids = get_user_card_ids(user_uuid)
+
+    user_crawled_tx = get_crawled_txns(site_uuid, source_terminal_filter=source_terminal_filter,
+                                       card_id_filter=user_card_ids) \
+        .assign(transactionTimestamp=lambda x: pd.to_datetime(x['transactionTimestamp']))
+
+    enrollment_timestamp = pd.to_datetime(
+        get_user_site_enrollment_timestamp(user_uuid=user_uuid, site_uuid=site_uuid)).tz_convert(None)
+
+    pre_user_crawled_tx = user_crawled_tx[(user_crawled_tx.transactionTimestamp < enrollment_timestamp)
+                                          & (user_crawled_tx.transactionTimestamp >= (
+                enrollment_timestamp - timedelta(days=365)))]
+    if pre_user_crawled_tx.empty:
+        is_new_at_site = True
+    else:
+        is_new_at_site = False
+
+    return {'site_uuid': site_uuid,
+            'user_uuid': user_uuid,
+            'is_new_at_site': is_new_at_site,
+            'user_card_ids': user_card_ids,
+            'enrollment_timestamp': enrollment_timestamp,
+            'pre_user_crawled_tx': pre_user_crawled_tx}
+
+
+def get_F6L4_is_new_at_site(Transactions, F6, L4, enrollTimestamp):
+    cardId_tx = Transactions[(Transactions.cardFirstSix == F6)
+                             & (Transactions.cardLastFour == L4)
+                             & (Transactions.TranTime < enrollTimestamp)
+                             & (Transactions.TranTime >= enrollTimestamp - timedelta(days=365))]
+    if cardId_tx.empty:
+        isNewAtSite = True
+    else:
+        isNewAtSite = False
+    return isNewAtSite
 
 
 def get_df_from_athena_query(query, conn):
@@ -618,10 +661,11 @@ def generate_site_calendar_time_data(panel_dict, site_uuid, source_terminal, mod
 
 
 def serialize_panels(panel_dict, site_uuid, source_terminal, output_dir='.'):
-    for user_uuid, user_panel in panel_dict.items():
-        path = f'{output_dir}/pSiteUuid={site_uuid}/pUserUuid={user_uuid}/pSourceTerminal={source_terminal}/'
-        os.makedirs(path, exist_ok=True)
-        user_panel.to_csv(f'{path}{user_uuid}-{source_terminal}-pre_post_panel.csv', index=False)
+    for id, user_panel in panel_dict.items():
+        if user_panel is not None:
+            path = f'{output_dir}/pSiteUuid={site_uuid}/pSourceTerminal={source_terminal}'
+            os.makedirs(path, exist_ok=True)
+            user_panel.to_csv(f'{path}/{id}.csv', index=False)
 
     return
 
@@ -635,9 +679,9 @@ def serialize_user_incremental(df_dict, site_uuid, source_terminal):
     return
 
 
-def serialize_site_pre_post_data(site_pre_post_data, site_uuid, source_terminal, output_dir='.'):
-    site_pre_post_data.to_csv(f'{output_dir}/pSiteUuid={site_uuid}/{site_uuid}-{source_terminal}-pre_post_data.csv',
-                              index=False)
+def serialize_df(df, output_dir, filename, keep_index=False):
+    os.makedirs(output_dir, exist_ok=True)
+    df.to_csv(f'{output_dir}/{filename}', index=keep_index)
     return
 
 
@@ -653,10 +697,18 @@ def get_outlier_flag(user_panel, max_avg_pre_total_amount_diff=200):
     return abs(user_pre_avg_total_amount - shadow_pre_avg_total_amount) > max_avg_pre_total_amount_diff
 
 
-def get_selected_users_pre_post_panels(source_terminal, site_and_user_filepath, output_dir='.'):
+def get_selected_users_pre_post_panels(source_terminal, site_and_user_list=None, site_and_user_filepath=None,
+                                       output_dir='.'):
     os.makedirs(output_dir, exist_ok=True)
-    site_user_uuid_df = pd.read_csv(site_and_user_filepath)
 
+    if (site_and_user_list is None) and (site_and_user_filepath is not None):
+        site_user_uuid_df = pd.read_csv(site_and_user_filepath)
+    elif site_and_user_list is not None and site_and_user_filepath is None:
+        site_user_uuid_df = pd.DataFrame(site_and_user_list).rename(columns={0: 'siteuuid', 1: 'useruuid'})
+    else:
+        raise ValueError('Invalid')
+
+    panel_dict = {}
     for site_uuid in site_user_uuid_df.siteuuid.unique():
         site_crawled_txns = get_crawled_txns(site_uuid, source_terminal)
 
@@ -668,12 +720,64 @@ def get_selected_users_pre_post_panels(source_terminal, site_and_user_filepath, 
                                                     first_crawled_txn_timestamp=None,
                                                     last_crawled_txn_timestamp=None)
             if user_panel is not None:
-                user_panel.to_csv(f'{output_dir}/{site_uuid}--{user_uuid}-{source_terminal}-pre_post_panel.csv',
+                user_panel.to_csv(f'{output_dir}/{site_uuid}--{user_uuid}--{source_terminal}-pre_post_panel.csv',
                                   index=False)
+                panel_dict[f'{site_uuid}--{user_uuid}--{source_terminal}'] = user_panel
+
+    return panel_dict
+
+
+def get_operator_input():
+    def get_input_source_terminal():
+        source_terminal = input(f"\n Which sourceterminal (press ENTER for OUTSIDE) ").strip()
+        if source_terminal == "":
+            source_terminal = 'OUTSIDE'
+        return source_terminal.upper()
+
+    def get_input_output_dir():
+        output_dir = input(f"\n What is the dir to write the output? (press ENTER for current dir) ").strip()
+        if output_dir == "":
+            output_dir = '.'
+        return output_dir
+
+    proceed = None
+    while proceed not in ['y', 'n']:
+        proceed = input(f"\n Run customer journey's for specific user-site pairs? (y/n) ").strip()
+        if proceed == 'y':
+            site_and_user_filepath = input(f"\n What is the path to siteuuid and useruuid file? ").strip()
+            source_terminal = get_input_source_terminal()
+            output_dir = get_input_output_dir()
+            get_selected_users_pre_post_panels(source_terminal=source_terminal,
+                                               site_and_user_list=None,
+                                               site_and_user_filepath=site_and_user_filepath,
+                                               output_dir=output_dir)
+
+    proceed = None
+    while proceed not in ['y', 'n']:
+        proceed = input(f"\n Run all customer journey's for site? (y/n) ").strip()
+        if proceed == 'y':
+            site_uuid = input(f"\n What is the siteuuid? ").strip()
+            source_terminal = get_input_source_terminal()
+            output_dir = get_input_output_dir()
+
+            panel_dict = generate_all_site_user_shadow_panels(site_uuid=site_uuid,
+                                                              source_terminal=source_terminal)
+            serialize_panels(panel_dict, site_uuid, source_terminal, output_dir)
+
+    proceed = None
+    while proceed not in ['y', 'n']:
+        proceed = input(f"\n Generate site-level pre-post data for a site or group of sites? (y/n) ").strip()
+        if proceed == 'y':
+            site_uuid = input(f"\n What is the siteuuid? ").strip()
+            source_terminal = get_input_source_terminal()
+            output_dir = get_input_output_dir()
+            filename = input(f"\n What is the filename? ").strip()
+
+            pre_post_data = generate_site_pre_post_data(site_uuid, source_terminal)
+            serialize_df(pre_post_data, output_dir, filename)
+
     return
 
 
 if __name__ == '__main__':
-    #     generate_pre_post_graph()
-    #
-    pass
+    get_operator_input()
