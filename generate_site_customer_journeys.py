@@ -1,6 +1,5 @@
 import json
 import boto3
-import math
 import os
 from baseline_service.client import BaselineService
 from transaction_service.clientV2 import TransactionService
@@ -12,7 +11,6 @@ import numpy as np
 from tqdm import *
 
 tqdm.pandas()
-import subprocess
 from datetime import timedelta
 
 USER_CARDS_FOUND_RESPONSE_CODE = 17210
@@ -26,7 +24,7 @@ Grid = []
 for Year in range(2010, 2025):
     for Month in range(1, 13):
         Period = Year * 100 + Month
-        Grid = Grid + [Period]
+        Grid += [Period]
 
 conn = connect(aws_access_key_id=AWS_ACCESS_KEY_ID,
                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -68,8 +66,8 @@ def get_crawledtxuuid_by_usertxuuid(user_txuuid, site_uuid):
     """
     try:
         crawledTxUuid = \
-        transaction_service.tx_info_get_by_utx_uuid_and_site(user_transaction_uuid=user_txuuid, site_uuid=site_uuid)[
-            'payload']['transaction']['crawledTxUuid']
+            transaction_service.tx_info_get_by_utx_uuid_and_site(user_transaction_uuid=user_txuuid,
+                                                                 site_uuid=site_uuid)['payload']['transaction']['crawledTxUuid']
     except Exception:
         crawledTxUuid = None
     return crawledTxUuid
@@ -109,7 +107,7 @@ def get_user_uuid_is_new_at_site(site_uuid, user_uuid, source_terminal_filter=No
 
     pre_user_crawled_tx = user_crawled_tx[(user_crawled_tx.transactionTimestamp < enrollment_timestamp)
                                           & (user_crawled_tx.transactionTimestamp >= (
-                enrollment_timestamp - timedelta(days=365)))]
+            enrollment_timestamp - timedelta(days=365)))]
     if pre_user_crawled_tx.empty:
         is_new_at_site = True
     else:
@@ -121,18 +119,6 @@ def get_user_uuid_is_new_at_site(site_uuid, user_uuid, source_terminal_filter=No
             'user_card_ids': user_card_ids,
             'enrollment_timestamp': enrollment_timestamp,
             'pre_user_crawled_tx': pre_user_crawled_tx}
-
-
-def get_F6L4_is_new_at_site(Transactions, F6, L4, enrollTimestamp):
-    cardId_tx = Transactions[(Transactions.cardFirstSix == F6)
-                             & (Transactions.cardLastFour == L4)
-                             & (Transactions.TranTime < enrollTimestamp)
-                             & (Transactions.TranTime >= enrollTimestamp - timedelta(days=365))]
-    if cardId_tx.empty:
-        isNewAtSite = True
-    else:
-        isNewAtSite = False
-    return isNewAtSite
 
 
 def get_df_from_athena_query(query, conn):
@@ -277,6 +263,7 @@ def get_crawled_txns(site_uuid, source_terminal_filter=None, card_id_filter=None
             f"  cardtype as cardType, " \
             f"  cardlastfour as cardLastFour, " \
             f"  cardfirstsix as cardFirstSix, " \
+            f"  CONCAT(cardfirstsix, '-', cardlastfour) as F6L4, " \
             f"  total.amount as totalAmount, " \
             f"  tax.amount as taxamount, " \
             f"  transactionuuid as transactionUuid, " \
