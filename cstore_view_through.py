@@ -6,8 +6,8 @@ from tqdm import *
 
 def get_user_unique_f6l4_cards(user_uuid):
     user_card_ids = gs.get_user_card_ids(user_uuid)
-    unique_fs_l4 = list(set([x.split('-')[1] + '-' + x.split('-')[2] for x in user_card_ids]))
-    return unique_fs_l4
+    unique_fsl4 = list(set([x.split('-')[1] + '-' + x.split('-')[2] for x in user_card_ids]))
+    return unique_fsl4
 
 # 1d0df9c3-452c-4d9c-b23a-9c81f8387ce5--f0cdf94e-a192-4890-b3e2-2af1c0377365--OUTSIDE
 
