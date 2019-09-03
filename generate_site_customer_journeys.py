@@ -3,7 +3,6 @@ import boto3
 import os
 from baseline_service.client import BaselineService
 from transaction_service.clientV2 import TransactionService
-from merchant_service.client import MerchantService
 from upside_core.services import create_private_service_with_retries
 from pyathena import connect
 import pandas as pd
