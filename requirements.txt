@@ -36,7 +36,7 @@ python-json-logger==0.1.11
 pytz==2019.2
 redis==3.3.8
 requests==2.22.0
-rsa==4.0
+rsa==4.7
 s3transfer==0.2.1
 semver==2.8.1
 simplejson==3.16.0
