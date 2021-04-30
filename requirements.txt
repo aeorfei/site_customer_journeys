@@ -48,4 +48,4 @@ transaction-service-client==2.10.3
 upside-core==6.8.1
 upside-model==6.4.0
 uritemplate==3.0.0
-urllib3==1.25.3
+urllib3==1.25.8
